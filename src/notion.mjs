@@ -1,1 +1,118 @@
-m«ëˆ§½©buªàºg§¶ÊÜşz-Š‰æÅ,j›jÇºà7an{¦Š)ßŠW¨¢ë_ŠW›n·š‘ºŞjG§r‡^v‹­¦ën¦)í¢X§zÊ•éà¶î˜7]yÊy×œ¡×¢›­†¥¥Ø¬¦V²¶¬™ë,j¢Šzn¶)éº×â•ç^}«¥µú+²×bŠ.¶›­¢ëiº×â•ç^}«¥µú+²×hº
+import { requestJson } from "./http.mjs";
+
+function plainText(value) {
+  if (!value) return "";
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) return value.map(plainText).filter(Boolean).join("");
+  return value.plain_text || value.text?.content || value.name || "";
+}
+
+export function richText(content) {
+  const value = String(content || "");
+  const chunks = value.match(/[\s\S]{1,2000}/g) || [];
+  return chunks.slice(0, 100).map((text) => ({ type: "text", text: { content: text } }));
+}
+
+export function captureProperties(record) {
+  return {
+    æ ‡é¢˜: { title: richText(record.title) },
+    åŸè¯: { rich_text: richText(record.raw) },
+    å†…å®¹: { rich_text: richText(record.polished) },
+    æ‘˜è¦: { rich_text: richText(record.summary) },
+    æ ‡ç­¾: { multi_select: record.tags.map((name) => ({ name })) },
+    æ—¥æœŸ: { date: { start: record.date } },
+    æ—¶æ®µ: { select: { name: record.period } },
+  };
+}
+
+export function weeklyProperties(review) {
+  return {
+    æ ‡é¢˜: { title: richText(review.title) },
+    æ—¥æœŸèŒƒå›´: { rich_text: richText(review.dateRange) },
+    å›é¡¾æ­£æ–‡: { rich_text: richText(review.body) },
+    æœ¬å‘¨ä¸»é¢˜: { multi_select: review.themes.map((name) => ({ name })) },
+    ç”Ÿæˆæ—¥æœŸ: { date: { start: review.generatedDate } },
+    è®°å½•æ¡æ•°: { number: review.count },
+  };
+}
+
+export function reflectionFromPage(page) {
+  const p = page?.properties || {};
+  return {
+    title: plainText(p.æ ‡é¢˜?.title) || "æ— æ ‡é¢˜",
+    content: plainText(p.å†…å®¹?.rich_text) || plainText(p.æ‘˜è¦?.rich_text),
+    tags: (p.æ ‡ç­¾?.multi_select || []).map((tag) => tag.name).filter(Boolean),
+  };
+}
+
+export class NotionClient {
+  constructor({ token, version = "2025-09-03" }) {
+    this.token = token;
+    this.version = version;
+    this.baseUrl = "https://api.notion.com/v1";
+    this.dataSources = new Map();
+  }
+
+  async request(path, options = {}) {
+    return requestJson(
+      `${this.baseUrl}${path}`,
+      {
+        ...options,
+        headers: {
+          Authorization: `Bearer ${this.token}`,
+          "Notion-Version": this.version,
+          "Content-Type": "application/json",
+          ...options.headers,
+        },
+      },
+      { attempts: 3, timeoutMs: 45_000, label: "Notion" },
+    );
+  }
+
+  async resolveDataSourceId(databaseOrDataSourceId) {
+    if (this.dataSources.has(databaseOrDataSourceId)) return this.dataSources.get(databaseOrDataSourceId);
+    try {
+      const database = await this.request(`/databases/${databaseOrDataSourceId}`);
+      const sources = database?.data_sources || [];
+      if (sources.length !== 1) {
+        throw new Error(`Notion æ•°æ®åº“åŒ…å« ${sources.length} ä¸ªæ•°æ®æºï¼Œè¯·åœ¨ Secret ä¸­å¡«å†™ç›®æ ‡ data_source_id`);
+      }
+      this.dataSources.set(databaseOrDataSourceId, sources[0].id);
+      return sources[0].id;
+    } catch (error) {
+      if (!/HTTP 404/.test(error.message)) throw error;
+      await this.request(`/data_sources/${databaseOrDataSourceId}`);
+      this.dataSources.set(databaseOrDataSourceId, databaseOrDataSourceId);
+      return databaseOrDataSourceId;
+    }
+  }
+
+  async createPage(databaseOrDataSourceId, properties) {
+    const dataSourceId = await this.resolveDataSourceId(databaseOrDataSourceId);
+    return this.request("/pages", {
+      method: "POST",
+      body: JSON.stringify({ parent: { type: "data_source_id", data_source_id: dataSourceId }, properties }),
+    });
+  }
+
+  async queryReflections(databaseOrDataSourceId, startDate) {
+    const dataSourceId = await this.resolveDataSourceId(databaseOrDataSourceId);
+    const results = [];
+    let cursor;
+    do {
+      const body = {
+        page_size: 100,
+        filter: { property: "æ—¥æœŸ", date: { on_or_after: startDate } },
+        sorts: [{ property: "æ—¥æœŸ", direction: "ascending" }],
+      };
+      if (cursor) body.start_cursor = cursor;
+      const page = await this.request(`/data_sources/${dataSourceId}/query`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      results.push(...(page.results || []));
+      cursor = page.has_more ? page.next_cursor : null;
+    } while (cursor);
+    return results.map(reflectionFromPage).filter((item) => item.content.trim());
+  }
+}
